@@ -13,7 +13,7 @@ import winrt.windows.storage.streams as wss
 
 log = logging.getLogger(__name__)
 
-APPLE_MUSIC_APP_ID = "AppleInc.AppleMusicWin_nzyj5cx40ttqa!App"
+APPLE_MUSIC_APP_ID = "AppleMusic.exe"
 THUMBNAIL_BUF_SIZE = 5 * 1024 * 1024  # 5 MB
 
 PlaybackStatus = wmc.GlobalSystemMediaTransportControlsSessionPlaybackStatus
