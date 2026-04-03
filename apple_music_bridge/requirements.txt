@@ -1,0 +1,6 @@
+winrt-runtime
+winrt-Windows.Media.Control
+winrt-Windows.Storage.Streams
+requests
+pystray
+Pillow
