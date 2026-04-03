@@ -124,7 +124,11 @@ def main():
     icon.menu = _build_menu(bridge, icon)
 
     log.info("Tray icon starting (main thread)")
-    icon.run()  # blocks until Quit is chosen
+    try:
+        icon.run()  # blocks until Quit is chosen
+    except KeyboardInterrupt:
+        bridge.stop()
+        icon.stop()
 
 
 if __name__ == "__main__":
