@@ -61,8 +61,8 @@ pystray
 Pillow
 
 ## 파일 구조
-apple_music_bridge/
+floating_lycs/
 ├── main.py          # 진입점, 트레이 아이콘, asyncio 스레드 관리
 ├── smtc_reader.py   # SMTC 폴링, Apple Music 세션 탐색
 ├── lyrs_poster.py   # tuna-obs 포맷 변환 및 HTTP POST
-└── requirements.txt
+└── requirements
