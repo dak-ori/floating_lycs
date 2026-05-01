@@ -14,6 +14,7 @@ Lyrs의 tuna-obs 서버(127.0.0.1:1608)로 전송합니다.
 import asyncio
 import json
 import sys
+import time
 import urllib.parse
 import urllib.request
 
@@ -144,7 +145,8 @@ async def main():
 
     last_title = None
     last_cover_url = None
-    last_progress_ms = 0
+    smtc_anchor_ms = 0
+    smtc_anchor_time = time.monotonic()
     not_found_printed = False
 
     while True:
@@ -165,13 +167,23 @@ async def main():
             current_title = state["data"].get("title")
             current_artist = state["data"].get("artists", [""])[0]
 
-            # SMTC position이 가사 경계 근처에서 살짝 뒤로 튀는 현상 방지
-            if "progress" in state["data"]:
-                progress_ms = state["data"]["progress"]
-                if progress_ms < last_progress_ms and (last_progress_ms - progress_ms) < 3000:
-                    state["data"]["progress"] = last_progress_ms
+            # SMTC position은 실시간이 아니라 스냅샷 → 내부 시계로 보간
+            if state["data"].get("status") == "playing" and "progress" in state["data"]:
+                raw_ms = state["data"]["progress"]
+                now = time.monotonic()
+                elapsed_ms = int((now - smtc_anchor_time) * 1000)
+                interpolated_ms = smtc_anchor_ms + elapsed_ms
+                if abs(raw_ms - interpolated_ms) > 2000:
+                    # 2초 이상 차이 → 사용자가 탐색했거나 새 곡 → 앵커 리셋
+                    smtc_anchor_ms = raw_ms
+                    smtc_anchor_time = now
+                    state["data"]["progress"] = raw_ms
                 else:
-                    last_progress_ms = progress_ms
+                    state["data"]["progress"] = interpolated_ms
+            else:
+                # 일시정지/정지 중엔 SMTC 값 그대로 쓰고 앵커 동기화
+                smtc_anchor_ms = state["data"].get("progress", smtc_anchor_ms)
+                smtc_anchor_time = time.monotonic()
 
             # 곡이 바뀌었을 때만 iTunes에서 커버를 새로 가져옴
             if current_title != last_title:
