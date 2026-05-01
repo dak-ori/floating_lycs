@@ -14,6 +14,7 @@ Lyrs의 tuna-obs 서버(127.0.0.1:1608)로 전송합니다.
 import asyncio
 import json
 import sys
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -203,8 +204,43 @@ async def main():
         await asyncio.sleep(POLL_INTERVAL)
 
 
+def _make_icon():
+    from PIL import Image, ImageDraw
+    img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    draw.ellipse([0, 0, 63, 63], fill=(250, 60, 60, 255))
+    draw.rectangle([27, 16, 32, 40], fill=(255, 255, 255, 255))
+    draw.polygon([(32, 16), (48, 21), (48, 30), (32, 25)], fill=(255, 255, 255, 255))
+    draw.ellipse([18, 34, 34, 46], fill=(255, 255, 255, 255))
+    return img
+
+
+def _run_bridge():
+    asyncio.run(main())
+
+
 if __name__ == "__main__":
     try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("\n종료했습니다.")
+        import pystray
+
+        icon = pystray.Icon(
+            "apple_music_lyrs",
+            _make_icon(),
+            "Apple Music → Lyrs",
+            menu=pystray.Menu(
+                pystray.MenuItem("Apple Music → Lyrs", None, enabled=False),
+                pystray.Menu.SEPARATOR,
+                pystray.MenuItem("종료", lambda icon, _: icon.stop()),
+            ),
+        )
+
+        t = threading.Thread(target=_run_bridge, daemon=True)
+        t.start()
+        icon.run()
+
+    except ImportError:
+        # pystray/Pillow 없으면 콘솔 모드로 fallback
+        try:
+            asyncio.run(main())
+        except KeyboardInterrupt:
+            print("\n종료했습니다.")
