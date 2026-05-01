@@ -1,0 +1,198 @@
+"""
+Apple Music (Microsoft Store) → Lyrs 브릿지
+=============================================
+Windows SMTC API로 Apple Music 재생 정보를 읽어
+Lyrs의 tuna-obs 서버(127.0.0.1:1608)로 전송합니다.
+
+설치:
+    pip install winrt-runtime winrt-Windows.Media.Control winrt-Windows.Storage.Streams
+
+실행:
+    python apple_music_lyrs_bridge.py
+"""
+
+import asyncio
+import json
+import sys
+import urllib.parse
+import urllib.request
+
+try:
+    from winrt.windows.media.control import (
+        GlobalSystemMediaTransportControlsSessionManager as MediaManager,
+        GlobalSystemMediaTransportControlsSessionPlaybackStatus as PlaybackStatus,
+    )
+except ImportError:
+    print("=" * 50)
+    print("winrt 패키지가 설치되어 있지 않습니다.")
+    print("아래 명령어로 설치해주세요:")
+    print()
+    print("    pip install winrt-runtime winrt-Windows.Media.Control winrt-Windows.Storage.Streams")
+    print("=" * 50)
+    sys.exit(1)
+
+# ── 설정 ─────────────────────────────────────────
+LYRS_URL = "http://127.0.0.1:1608"
+POLL_INTERVAL = 0.2
+APPLE_MUSIC_APP_IDS = [
+    "AppleInc.AppleMusic",
+    "Apple.AppleMusic",
+]
+# ─────────────────────────────────────────────────
+
+
+def post_to_lyrs(data: dict) -> bool:
+    body = json.dumps(data).encode("utf-8")
+    req = urllib.request.Request(
+        LYRS_URL,
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=1) as resp:
+            return resp.status == 200
+    except Exception:
+        return False
+
+
+def parse_artist(raw_artist: str) -> str:
+    """Apple Music SMTC는 artist 필드에 '아티스트 — 앨범' 형식으로 넣어줌."""
+    return raw_artist.split(" — ")[0].strip()
+
+
+async def fetch_itunes_cover(title: str, artist: str) -> str | None:
+    """iTunes Search API로 앨범 커버 URL을 가져옵니다."""
+    try:
+        query = urllib.parse.quote(f"{artist} {title}")
+        url = f"https://itunes.apple.com/search?term={query}&media=music&entity=song&limit=5"
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            data = json.loads(resp.read())
+        results = data.get("results", [])
+        if not results:
+            return None
+        # 100x100 → 600x600 고해상도로 교체
+        artwork = results[0].get("artworkUrl100", "")
+        return artwork.replace("100x100bb", "600x600bb") if artwork else None
+    except Exception:
+        return None
+
+
+def find_apple_music_session(sessions):
+    all_sessions = sessions.get_sessions()
+    for session in all_sessions:
+        app_id = session.source_app_user_model_id or ""
+        for known_id in APPLE_MUSIC_APP_IDS:
+            if known_id.lower() in app_id.lower():
+                return session
+        if "apple" in app_id.lower():
+            return session
+    return None
+
+
+PLAYBACK_STATUS_MAP = {
+    PlaybackStatus.CLOSED: "idle",
+    PlaybackStatus.OPENED: "idle",
+    PlaybackStatus.CHANGING: "paused",
+    PlaybackStatus.STOPPED: "idle",
+    PlaybackStatus.PLAYING: "playing",
+    PlaybackStatus.PAUSED: "paused",
+}
+
+
+async def get_current_state(session) -> dict:
+    try:
+        props = await session.try_get_media_properties_async()
+        timeline = session.get_timeline_properties()
+        playback = session.get_playback_info()
+    except Exception:
+        return {"data": {"status": "idle"}}
+
+    raw_status = playback.playback_status if playback else None
+    status = PLAYBACK_STATUS_MAP.get(raw_status, "idle")
+
+    if status == "idle":
+        return {"data": {"status": "idle"}}
+
+    try:
+        progress_ms = int(timeline.position.total_seconds() * 1000)
+        duration_ms = int(timeline.end_time.total_seconds() * 1000)
+    except Exception:
+        progress_ms = 0
+        duration_ms = 0
+
+    title = props.title or ""
+    artist = parse_artist(props.artist or "")   # "아티스트 — 앨범" → "아티스트"
+
+    return {
+        "data": {
+            "status": status,
+            "title": title,
+            "artists": [artist] if artist else [],
+            "progress": progress_ms,
+            "duration": duration_ms,
+            "cover_url": "",
+        }
+    }
+
+
+async def main():
+    print("🎵 Apple Music → Lyrs 브릿지")
+    print(f"   Lyrs 서버: {LYRS_URL}")
+    print("   종료: Ctrl+C\n")
+
+    last_title = None
+    last_cover_url = None
+    last_progress_ms = 0
+    not_found_printed = False
+
+    while True:
+        try:
+            sessions = await MediaManager.request_async()
+            session = find_apple_music_session(sessions)
+
+            if session is None:
+                if not not_found_printed:
+                    print("⏹  Apple Music 세션을 찾을 수 없습니다. Apple Music이 실행 중인지 확인하세요.")
+                    not_found_printed = True
+                post_to_lyrs({"data": {"status": "idle"}})
+                await asyncio.sleep(1)
+                continue
+
+            not_found_printed = False
+            state = await get_current_state(session)
+            current_title = state["data"].get("title")
+            current_artist = state["data"].get("artists", [""])[0]
+
+            # SMTC position이 가사 경계 근처에서 살짝 뒤로 튀는 현상 방지
+            if "progress" in state["data"]:
+                progress_ms = state["data"]["progress"]
+                if progress_ms < last_progress_ms and (last_progress_ms - progress_ms) < 3000:
+                    state["data"]["progress"] = last_progress_ms
+                else:
+                    last_progress_ms = progress_ms
+
+            # 곡이 바뀌었을 때만 iTunes에서 커버를 새로 가져옴
+            if current_title != last_title:
+                last_cover_url = await fetch_itunes_cover(current_title, current_artist)
+                last_title = current_title
+                status = state["data"].get("status", "idle")
+                icon = "▶" if status == "playing" else "⏸" if status == "paused" else "⏹"
+                cover_ok = "🖼" if last_cover_url else "❌"
+                print(f"{icon}  {current_title}  [{current_artist}]  커버:{cover_ok}")
+
+            state["data"]["cover_url"] = last_cover_url or ""
+            post_to_lyrs(state)
+
+        except Exception as e:
+            print(f"⚠ 오류: {e}")
+
+        await asyncio.sleep(POLL_INTERVAL)
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n종료했습니다.")
