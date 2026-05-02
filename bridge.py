@@ -13,6 +13,7 @@ Lyrs의 tuna-obs 서버(127.0.0.1:1608)로 전송합니다.
 
 import asyncio
 import json
+import ssl
 import sys
 import threading
 import time
@@ -35,7 +36,8 @@ except ImportError:
 
 # ── 설정 ─────────────────────────────────────────
 LYRS_URL = "http://127.0.0.1:1608"
-POLL_INTERVAL = 0.2
+POLL_INTERVAL_PLAYING = 0.2   # 재생 중 — 가사 동기화에 필요한 빈도
+POLL_INTERVAL_PAUSED  = 1.0   # 일시정지 / 정지 / 미발견 — CPU 절약
 APPLE_MUSIC_APP_IDS = [
     "AppleInc.AppleMusic",
     "Apple.AppleMusic",
@@ -43,8 +45,8 @@ APPLE_MUSIC_APP_IDS = [
 # ─────────────────────────────────────────────────
 
 
-def post_to_lyrs(data: dict) -> bool:
-    body = json.dumps(data).encode("utf-8")
+def _post_to_lyrs_sync(body: bytes) -> bool:
+    """블로킹 HTTP POST — run_in_executor에서만 호출."""
     req = urllib.request.Request(
         LYRS_URL,
         data=body,
@@ -58,27 +60,49 @@ def post_to_lyrs(data: dict) -> bool:
         return False
 
 
+async def post_to_lyrs(data: dict) -> bool:
+    body = json.dumps(data).encode("utf-8")
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, _post_to_lyrs_sync, body)
+
+
 def parse_artist(raw_artist: str) -> str:
     """Apple Music SMTC는 artist 필드에 '아티스트 — 앨범' 형식으로 넣어줌."""
     return raw_artist.split(" — ")[0].strip()
 
 
-async def fetch_itunes_cover(title: str, artist: str) -> str | None:
-    """iTunes Search API로 앨범 커버 URL을 가져옵니다."""
+def _make_ssl_context() -> ssl.SSLContext:
+    try:
+        import certifi
+        return ssl.create_default_context(cafile=certifi.where())
+    except ImportError:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        return ctx
+
+
+def _fetch_itunes_cover_sync(title: str, artist: str) -> str | None:
+    """블로킹 iTunes Search API 호출 — run_in_executor에서만 호출."""
     try:
         query = urllib.parse.quote(f"{artist} {title}")
         url = f"https://itunes.apple.com/search?term={query}&media=music&entity=song&limit=5"
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=3) as resp:
+        with urllib.request.urlopen(req, timeout=3, context=_make_ssl_context()) as resp:
             data = json.loads(resp.read())
         results = data.get("results", [])
         if not results:
             return None
-        # 100x100 → 600x600 고해상도로 교체
         artwork = results[0].get("artworkUrl100", "")
         return artwork.replace("100x100bb", "600x600bb") if artwork else None
     except Exception:
         return None
+
+
+async def fetch_itunes_cover(title: str, artist: str) -> str | None:
+    """iTunes Search API로 앨범 커버 URL을 가져옵니다."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, _fetch_itunes_cover_sync, title, artist)
 
 
 def find_apple_music_session(sessions):
@@ -149,27 +173,34 @@ async def main():
     smtc_anchor_ms = 0
     smtc_anchor_time = time.monotonic()
     not_found_printed = False
+    last_sent_key = None    # (status, title, cover_url) — 중복 POST 방지
+    sessions = None         # MediaManager 캐시 — 매 틱 재생성 방지
 
     while True:
+        poll_interval = POLL_INTERVAL_PAUSED
         try:
-            sessions = await MediaManager.request_async()
+            # MediaManager는 WinRT 싱글턴 — 오류 시에만 재요청
+            if sessions is None:
+                sessions = await MediaManager.request_async()
+
             session = find_apple_music_session(sessions)
 
             if session is None:
                 if not not_found_printed:
                     print("⏹  Apple Music 세션을 찾을 수 없습니다. Apple Music이 실행 중인지 확인하세요.")
                     not_found_printed = True
-                post_to_lyrs({"data": {"status": "idle"}})
-                await asyncio.sleep(1)
+                await post_to_lyrs({"data": {"status": "idle"}})
+                await asyncio.sleep(poll_interval)
                 continue
 
             not_found_printed = False
             state = await get_current_state(session)
+            current_status = state["data"].get("status", "idle")
             current_title = state["data"].get("title")
             current_artist = state["data"].get("artists", [""])[0]
 
             # SMTC position은 실시간이 아니라 스냅샷 → 내부 시계로 보간
-            if state["data"].get("status") == "playing" and "progress" in state["data"]:
+            if current_status == "playing" and "progress" in state["data"]:
                 raw_ms = state["data"]["progress"]
                 now = time.monotonic()
                 elapsed_ms = int((now - smtc_anchor_time) * 1000)
@@ -190,18 +221,26 @@ async def main():
             if current_title != last_title:
                 last_cover_url = await fetch_itunes_cover(current_title, current_artist)
                 last_title = current_title
-                status = state["data"].get("status", "idle")
-                icon = "▶" if status == "playing" else "⏸" if status == "paused" else "⏹"
+                icon = "▶" if current_status == "playing" else "⏸" if current_status == "paused" else "⏹"
                 cover_ok = "🖼" if last_cover_url else "❌"
                 print(f"{icon}  {current_title}  [{current_artist}]  커버:{cover_ok}")
 
             state["data"]["cover_url"] = last_cover_url or ""
-            post_to_lyrs(state)
+
+            # 재생 중: 항상 POST (가사 위치 추적에 필요)
+            # 정지 / 일시정지: 상태가 바뀔 때만 POST
+            sent_key = (current_status, current_title, last_cover_url)
+            if current_status == "playing" or sent_key != last_sent_key:
+                await post_to_lyrs(state)
+                last_sent_key = sent_key
+
+            poll_interval = POLL_INTERVAL_PLAYING if current_status == "playing" else POLL_INTERVAL_PAUSED
 
         except Exception as e:
             print(f"⚠ 오류: {e}")
+            sessions = None  # WinRT 핸들 오류 시 재취득
 
-        await asyncio.sleep(POLL_INTERVAL)
+        await asyncio.sleep(poll_interval)
 
 
 def _make_icon():
